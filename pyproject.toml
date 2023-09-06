@@ -16,11 +16,14 @@ keywords = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.6"
-sqlite-utils = "~1.11"
+python = "^3.7"
+sqlite-utils = "^3.35"
+beautifulsoup4 = "^4.12.2"
+rich = "^13.5.2"
+lxml = "^4.9.3"
 
 [tool.poetry.dev-dependencies]
-pytest = "^4.6.11"
+pytest = "^7.4.1"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
