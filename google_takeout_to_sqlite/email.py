@@ -7,6 +7,8 @@ from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from email import policy, header, headerregistry
 import datetime
 
+from sqlite_utils import Database
+
 # This policy is similar to policy.default but without strict header parsing.
 # Many emails contain invalid headers that cannot be parsed according to spec.
 header_factory = headerregistry.HeaderRegistry(use_default_map=False)
@@ -62,6 +64,7 @@ def parse_mbox(mbox_file):
                     ).groups()
                     lines = []
                 elif is_eof:
+                    # NOTE add len(line) > 10_000 to test a small subset of a large inbox
                     break
 
 
@@ -109,29 +112,111 @@ def get_mbox(mbox_file):
             continue
 
 
+from nameparser import HumanName
+
+
+def name_details(name):
+    # remove any quotes or spaces from the beginning or end
+    name = name.strip("'\" ")
+    name_parts = HumanName(name)
+
+    return {
+        "name": name,
+        "firstName": name_parts.first,
+        "middleName": name_parts.middle,
+        "lastName": name_parts.last,
+    }
+
+
 # assume format of `First Last <email@domain.com>`, `email@domain.com`, or `<email@domain.com>`
-def extract_email(from_header):
+def extract_email(from_header, with_name=False):
+    """
+    "Amazon.com" <shipment-tracking@amazon.com>
+    """
     if from_header is None:
         return None
 
+    from_header = from_header.strip()
+
     match = re.match(r"(.*)<(.*)>", from_header)
     if match:
+        if with_name:
+            return name_details(match.group(1)) | {"email": match.group(2).strip()}
         return match.group(2)
 
     match = re.match(r"<(.*)>", from_header)
     if match:
-        return match.group(1)
+        extracted_email = match.group(1).strip()
+
+        if "'" in extracted_email or '"' in extracted_email:
+            breakpoint()
+
+        if with_name:
+            return {"name": None, "email": extracted_email}
+        return extracted_email
+
+    # this case is just a raw email address
+    if with_name:
+        return {"name": None, "email": from_header}
 
     return from_header
 
 
-def extract_emails(to_header) -> list[str]:
+def extract_email_from_tuple(from_tuple: tuple[str, str], with_details: bool):
+    """
+    email.utils.getaddresses([to_header]) =>
+
+       ('Flip Howard', 'flip@lucidprivateoffices.com')
+       ('davidskiviatsr@gmail.com', 'davidskiviatsr@gmail.com')
+    """
+
+    if from_tuple[0] == "" and from_tuple[1] == "":
+        return None
+
+    if not with_details:
+        # then just return the email
+        return from_tuple[1]
+
+    has_name = from_tuple[0] != from_tuple[1] and from_tuple[0]
+
+    name = from_tuple[0]
+    name = name.strip("'\" ")
+
+    email = from_tuple[1]
+    email = email.strip("'\" ").lower()
+
+    if "@" not in email:
+        # not a valid email, probably spam or some other garbage
+        return None
+
+    # extract domain from email
+    domain = email.split("@")[1]
+
+    if not has_name:
+        return {
+            "domain": domain,
+            "email": email,
+        }
+
+    return name_details(name) | {
+        "domain": domain,
+        "email": email,
+    }
+
+
+def extract_emails(to_header, with_details=False) -> list[str]:
     if to_header is None:
         return []
 
     emails = []
-    for email in to_header.split(","):
-        emails.append(extract_email(email))
+
+    # naive "," split will break on names with commas
+    email_list = email.utils.getaddresses([to_header])
+
+    for contact_tuple in email_list:
+        emails.append(
+            extract_email_from_tuple(contact_tuple, with_details=with_details)
+        )
 
     return emails
 
@@ -144,6 +229,8 @@ def extract_labels(labels_header):
 
 
 def normalize_mbox_message(message):
+    # TODO allow certain labels (like spam) to be excluded
+
     return {
         "id": message["Message-Id"],
         "gmail_thread_id": message["X-GM-THRID"],
@@ -151,45 +238,129 @@ def normalize_mbox_message(message):
         "from": message["From"],
         "from_email": extract_email(message["From"]),
         "to": message["To"],
+        "to_contacts": extract_emails(message["To"], with_details=True),
         "to_emails": extract_emails(message["To"]),
         "cc": message["Cc"],
+        "cc_contacts": extract_emails(message["Cc"], with_details=True),
         "cc_emails": extract_emails(message["Cc"]),
         "bcc": message["Bcc"],
         "bcc_emails": extract_emails(message["Bcc"]),
+        "bcc_contacts": extract_emails(message["Bcc"], with_details=True),
         "all_recipients": extract_emails(message["To"])
         + extract_emails(message["Cc"])
         + extract_emails(message["Bcc"]),
+        "all_contacts": extract_emails(message["To"], with_details=True)
+        + extract_emails(message["Cc"], with_details=True)
+        + extract_emails(message["Bcc"], with_details=True),
         "subject": message["Subject"],
         "date": message["date"],
         "body": message["body"],
     }
 
 
-from ipdb import iex
+def generate_table_name(prefix):
+    root_name = "mbox_emails"
+
+    if prefix:
+        root_name = f"{prefix}_{root_name}"
+
+    return root_name
 
 
-@iex
-def save_emails(db, mbox_file):
+def create_views(db: Database, prefix):
+    """
+    Create additional materialized views
+    """
+
+    print("Creating views...")
+
+    table_name = generate_table_name(prefix)
+    formatted_prefix = f"{prefix}_" if prefix else ""
+
+    address_book = f"""
+CREATE VIEW {formatted_prefix}address_book AS
+SELECT
+    json_extract(contact.value, '$.email') AS email,
+    json_extract(contact.value, '$.name') AS name,
+    json_extract(contact.value, '$.firstName') AS first_name,
+    json_extract(contact.value, '$.lastName') AS last_name,
+    json_extract(contact.value, '$.domain') AS domain,
+    MAX({table_name}.date) AS last_contacted,
+    COUNT(*) AS count_contact
+FROM {table_name},
+     json_each({table_name}.all_contacts) AS contact
+GROUP BY json_extract(contact.value, '$.email');
+"""
+
+    db.conn.execute("DROP VIEW IF EXISTS address_book")
+    db.conn.execute(address_book)
+
+    # determine whose email inbox this is
+    owner_email_query = f"""
+SELECT json_extract(to_emails, '$[0]') as owner_email
+FROM {table_name}
+WHERE to_emails != '[]'
+GROUP BY to_emails
+ORDER BY COUNT(*) DESC
+LIMIT 1;
+"""
+    owner_email = db.execute(owner_email_query).fetchone()[0]
+
+    to_address_book_query = f"""
+CREATE VIEW {formatted_prefix}to_address_book AS
+SELECT
+    json_extract(contact.value, '$.email') AS email,
+    json_extract(contact.value, '$.name') AS name,
+    json_extract(contact.value, '$.firstName') AS first_name,
+    json_extract(contact.value, '$.lastName') AS last_name,
+    json_extract(contact.value, '$.domain') AS domain,
+    MAX({table_name}.date) AS last_contacted,
+    COUNT(*) AS count_contact
+FROM {table_name},
+     json_each({table_name}.to_contacts) AS contact
+WHERE from_email = '{owner_email}'
+GROUP BY json_extract(contact.value, '$.email')
+"""
+
+    db.execute(to_address_book_query)
+
+    personal_to_address_book_query = f"""
+CREATE VIEW {formatted_prefix}filtered_to_address_book AS
+SELECT *
+FROM {formatted_prefix}to_address_book
+WHERE DOMAIN NOT LIKE '%.%.%'
+  AND DOMAIN NOT IN ('amazonses.com', 'craigslist.org', 'amazon.com', 'mandrillapp.com', 'fut.io', 'followup.cc', 'todoist.net', 'tmomail.net')
+  AND NOT (
+    EMAIL LIKE 'customer%' OR
+    EMAIL LIKE 'support%' OR
+    EMAIL LIKE 'info%' OR
+    EMAIL LIKE 'billing%' OR
+    EMAIL LIKE 'care%' OR
+    EMAIL LIKE 'hi%' OR
+    EMAIL LIKE 'bounce%' OR
+    EMAIL LIKE 'hello%' OR
+    EMAIL LIKE 'newsletter%' OR
+    EMAIL LIKE 'team%' OR
+    EMAIL LIKE 'service%' OR
+    EMAIL LIKE 'reply%' OR
+    EMAIL LIKE 'noreply%' OR
+    EMAIL LIKE 'notification%' OR
+    EMAIL LIKE 'help%' OR
+    EMAIL LIKE 'sales%'
+  );
+"""
+    owner_email = db.execute(personal_to_address_book_query)
+
+
+def save_emails(db, mbox_file, prefix):
     """
     Import Gmail mbox from google takeout
     """
 
-    # if not db["mbox_emails"].exists():
-    #     db["mbox_emails"].create(
-    #         {
-    #             "id": str,
-    #             "X-GM-THRID": str,
-    #             "X-Gmail-Labels": str,
-    #             "from": str,
-    #             "to": str,
-    #             "subject": str,
-    #             "when": str,
-    #             "body": str,
-    #         },
-    #         pk="id",
-    #     )
+    table_name = generate_table_name(prefix)
 
-    db["mbox_emails"].upsert_all(
+    # TODO if no messages are processed, the table is not created
+    db[table_name].upsert_all(
         (normalize_mbox_message(message) for message in get_mbox(mbox_file)),
         pk="id",
         alter=True,
@@ -198,7 +369,7 @@ def save_emails(db, mbox_file):
     print("Finished loading emails into {}.".format(mbox_file))
 
     print('Enabling full text search on "body" and "Subject" fields')
-    db["mbox_emails"].enable_fts(["body", "Subject"])
+    db[table_name].enable_fts(["body", "Subject"])
 
     print("Finished!")
 

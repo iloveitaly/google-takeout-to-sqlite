@@ -1,8 +1,9 @@
 import click
 import sqlite_utils
-from google_takeout_to_sqlite import utils
 import sqlite_utils
 import zipfile
+from . import utils
+from . import email
 
 
 @click.group()
@@ -58,11 +59,17 @@ def location_history(db_path, zip_path):
     type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
     required=True,
 )
-def my_mbox(db_path, mbox_path):
+@click.option("--views", is_flag=True, help="Create additional materialized views")
+@click.option("--prefix", help="Prefix for mbox table names")
+def my_mbox(db_path, mbox_path, views, prefix):
     """
     Import all emails from Gmail mbox to SQLite
 
     Usage:  google-takeout-to-sqlite mbox mygmail.db /path/to/gmail.mbox
     """
     db = sqlite_utils.Database(db_path)
-    utils.save_emails(db, mbox_path)
+
+    email.save_emails(db, mbox_path, prefix)
+
+    if views:
+        email.create_views(db, prefix)
