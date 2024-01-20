@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "google-takeout-to-sqlite"
-version = "0.2"
+version = "null"
 description = "Save data from Google Takeout to a SQLite database"
 authors = ["Simon Willison <swillison@gmail.com>"]
 license = "Apache License, Version 2.0"
